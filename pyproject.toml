@@ -1,0 +1,25 @@
+[project]
+name = "magic-claw"
+version = "0.1.0"
+description = "Local always-on terminal agent with hardware auto-configuration."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "rich>=13.9.4",
+  "pydantic>=2.10.0",
+  "psutil>=6.1.0",
+  "httpx>=0.28.0",
+  "huggingface-hub>=0.27.0",
+  "python-dotenv>=1.0.1"
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.3.0"
+]
+
+[project.scripts]
+magic-claw = "magic_claw.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
