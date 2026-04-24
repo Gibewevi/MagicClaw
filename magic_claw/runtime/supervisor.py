@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 
 from magic_claw.agent import AgentLoop
 from magic_claw.config import MagicConfig
@@ -73,12 +74,22 @@ class Supervisor:
         telegram_thread: threading.Thread | None = None
         while not self.stop_event.is_set():
             try:
-                self.on_status("Starting local model server")
+                model_name = Path(self.config.runtime.model_path).name
+                startup_prefix = (
+                    f"Loading {model_name} | {self.config.runtime.quantization} | "
+                    f"ctx {self.config.runtime.context_tokens}"
+                )
+                self.on_status(f"Launching llama-server for {model_name}")
                 self.server.start()
-                if not self.server.wait_until_ready(timeout_seconds=240):
+                self.on_status(f"{startup_prefix} | PID {self.server.process_id} | waiting for API")
+                if not self.server.wait_until_ready(
+                    timeout_seconds=240,
+                    on_status=self.on_status,
+                    status_prefix=startup_prefix,
+                ):
                     raise RuntimeError("Model server did not become ready.")
                 self.state.event("info", "supervisor", "model server ready")
-                self.on_status("Model server ready")
+                self.on_status(f"Ready | API {self.config.runtime.api_base} | model {model_name}")
                 if telegram_thread is None:
                     telegram_thread = self._start_telegram_thread()
 
@@ -86,6 +97,10 @@ class Supervisor:
                 while not self.stop_event.is_set():
                     if not self.server.healthy(timeout_seconds=5):
                         raise RuntimeError("Model healthcheck failed.")
+                    telegram_state = "on" if self.config.telegram.enabled else "off"
+                    self.on_status(
+                        f"Ready | API {self.config.runtime.api_base} | Telegram {telegram_state} | restarts {self.restarts}"
+                    )
                     time.sleep(10)
             except KeyboardInterrupt:
                 self.stop_event.set()
@@ -96,4 +111,3 @@ class Supervisor:
                 self.server.stop()
                 time.sleep(backoff)
                 backoff = min(backoff * 1.7, 120)
-
