@@ -69,19 +69,24 @@ class Supervisor:
         thread.start()
         return thread
 
+    def _model_label(self) -> str:
+        name = Path(self.config.runtime.model_path).stem
+        for suffix in ("-GGUF", ".gguf"):
+            name = name.replace(suffix, "")
+        if len(name) > 28:
+            return name[:25] + "..."
+        return name
+
     def run_forever(self) -> None:
         backoff = 2.0
         telegram_thread: threading.Thread | None = None
         while not self.stop_event.is_set():
             try:
-                model_name = Path(self.config.runtime.model_path).name
-                startup_prefix = (
-                    f"Loading {model_name} | {self.config.runtime.quantization} | "
-                    f"ctx {self.config.runtime.context_tokens}"
-                )
-                self.on_status(f"Launching llama-server for {model_name}")
+                model_label = self._model_label()
+                startup_prefix = f"Loading {model_label}"
+                self.on_status(f"Starting {model_label}")
                 self.server.start()
-                self.on_status(f"{startup_prefix} | PID {self.server.process_id} | waiting for API")
+                self.on_status(f"{startup_prefix} | waiting for API | 0s")
                 if not self.server.wait_until_ready(
                     timeout_seconds=240,
                     on_status=self.on_status,
@@ -89,7 +94,7 @@ class Supervisor:
                 ):
                     raise RuntimeError("Model server did not become ready.")
                 self.state.event("info", "supervisor", "model server ready")
-                self.on_status(f"Ready | API {self.config.runtime.api_base} | model {model_name}")
+                self.on_status(f"Ready | {model_label}")
                 if telegram_thread is None:
                     telegram_thread = self._start_telegram_thread()
 
@@ -98,9 +103,7 @@ class Supervisor:
                     if not self.server.healthy(timeout_seconds=5):
                         raise RuntimeError("Model healthcheck failed.")
                     telegram_state = "on" if self.config.telegram.enabled else "off"
-                    self.on_status(
-                        f"Ready | API {self.config.runtime.api_base} | Telegram {telegram_state} | restarts {self.restarts}"
-                    )
+                    self.on_status(f"Ready | Telegram {telegram_state} | restarts {self.restarts}")
                     time.sleep(10)
             except KeyboardInterrupt:
                 self.stop_event.set()

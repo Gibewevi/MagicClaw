@@ -2,6 +2,7 @@ from magic_claw.hardware import CpuInfo, GpuInfo, HardwareInfo, MemoryInfo
 from magic_claw.models.catalog import recommended_models
 from magic_claw.models.recent import compatible_model_plans
 from magic_claw.runtime.llama_binary import _asset_score
+from magic_claw.runtime.llama_server import _friendly_startup_stage, _startup_status
 
 
 def test_rtx_3090_prefers_mid_sized_models_for_stability():
@@ -60,3 +61,14 @@ def test_llama_runtime_selection_ignores_cudart_dependency_archives():
     )
     assert _asset_score("cudart-llama-bin-win-cuda-12.4-x64.zip", hardware) == 9999
     assert _asset_score("llama-b8920-bin-win-cuda-12.4-x64.zip", hardware) < 9999
+
+
+def test_llama_startup_status_stays_short_and_readable():
+    stage = _friendly_startup_stage(
+        "common_params_fit_impl: getting device memory data for initial parameters:"
+    )
+    assert stage == "checking VRAM"
+    assert _startup_status("Loading Qwen3.6-27B-IQ4_XS", 42, stage) == (
+        "Loading Qwen3.6-27B-IQ4_XS | checking VRAM | 42s"
+    )
+    assert _friendly_startup_stage("load_tensors: offloaded 65/65 layers to GPU") == "GPU layers 65/65"

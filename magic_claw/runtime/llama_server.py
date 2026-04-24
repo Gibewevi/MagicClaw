@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -100,6 +101,9 @@ class LlamaServer:
                 return line
         return ""
 
+    def latest_startup_stage(self) -> str:
+        return _friendly_startup_stage(self.latest_log_line())
+
     def wait_until_ready(
         self,
         timeout_seconds: int = 180,
@@ -113,36 +117,31 @@ class LlamaServer:
             if self.process and self.process.poll() is not None:
                 _emit_status(
                     on_status,
-                    f"{status_prefix} | stopped after {elapsed}s | {self.latest_log_line() or 'no server log'}",
+                    f"{status_prefix} | stopped after {elapsed}s | check logs",
                 )
                 return False
             if self.healthy(timeout_seconds=1.0):
-                _emit_status(on_status, f"{status_prefix} | API ready after {elapsed}s | {self.models_url}")
+                _emit_status(on_status, f"{status_prefix} | ready in {elapsed}s")
                 return True
+            stage = self.latest_startup_stage()
             _emit_status(
                 on_status,
                 _startup_status(
                     status_prefix=status_prefix,
-                    pid=self.process_id,
                     elapsed=elapsed,
-                    timeout=timeout_seconds,
-                    detail=self.latest_log_line(),
+                    stage=stage,
                 ),
             )
             time.sleep(2)
         _emit_status(
             on_status,
-            f"{status_prefix} | timeout after {timeout_seconds}s | {self.latest_log_line() or 'check logs'}",
+            f"{status_prefix} | timeout after {timeout_seconds}s | check logs",
         )
         return False
 
 
-def _startup_status(status_prefix: str, pid: int | None, elapsed: int, timeout: int, detail: str) -> str:
-    pid_text = f"PID {pid}" if pid else "PID pending"
-    message = f"{status_prefix} | {pid_text} | {elapsed}s/{timeout}s"
-    if detail:
-        message += f" | {detail}"
-    return message
+def _startup_status(status_prefix: str, elapsed: int, stage: str) -> str:
+    return f"{status_prefix} | {stage} | {elapsed}s"
 
 
 def _emit_status(callback: StatusCallback | None, message: str) -> None:
@@ -172,3 +171,37 @@ def _tail_interesting_line(path: Path, start_offset: int = 0, max_bytes: int = 8
             return cleaned[: max_length - 3] + "..."
         return cleaned
     return ""
+
+
+def _friendly_startup_stage(line: str) -> str:
+    lower = line.lower()
+    if not lower:
+        return "starting"
+    if "getting device memory" in lower:
+        return "checking VRAM"
+    if "loading model tensors" in lower:
+        return "loading model"
+    if "offloading output layer" in lower:
+        return "moving output layer to GPU"
+    offloaded = re.search(r"offloaded\s+(\d+/\d+)\s+layers", lower)
+    if offloaded:
+        return f"GPU layers {offloaded.group(1)}"
+    if "offloading" in lower and "layers" in lower:
+        return "moving layers to GPU"
+    if "model buffer size" in lower:
+        return "mapping model memory"
+    if "constructing llama_context" in lower:
+        return "building context"
+    if "kv cache" in lower:
+        return "allocating KV cache"
+    if "sched_reserve" in lower:
+        return "preparing compute"
+    if "warming up" in lower:
+        return "warming up"
+    if "initializing slots" in lower:
+        return "initializing slots"
+    if "listening" in lower or "server is listening" in lower:
+        return "starting API"
+    if "error" in lower or "failed" in lower:
+        return "startup issue"
+    return "loading"
