@@ -117,3 +117,4 @@ if (-not $MagicArgs -or $MagicArgs.Count -eq 0) {
 } else {
     & $Python -m magic_claw @MagicArgs
 }
+exit $LASTEXITCODE

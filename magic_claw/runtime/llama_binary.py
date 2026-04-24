@@ -38,6 +38,8 @@ def _asset_score(name: str, hardware: HardwareInfo) -> int:
     lower = name.lower()
     system = platform.system().lower()
     score = 0
+    if "cudart" in lower:
+        return 9999
     if system == "windows":
         if "win" not in lower or not lower.endswith(".zip"):
             return 9999
@@ -129,4 +131,3 @@ def ensure_llama_server_binary(hardware: HardwareInfo, auto_download: bool = Tru
     if not found:
         raise LlamaBinaryError("Downloaded llama.cpp, but llama-server binary was not found after extraction.")
     return found
-

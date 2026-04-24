@@ -20,6 +20,36 @@ from .state import StateStore
 from .ui import MagicConsole
 
 
+def _runtime_ready() -> bool:
+    config = load_config()
+    model_path = Path(config.runtime.model_path) if config.runtime.model_path else None
+    llama_path = Path(config.runtime.llama_server_path) if config.runtime.llama_server_path else None
+    return bool(model_path and model_path.exists() and llama_path and llama_path.exists())
+
+
+def _model_ready(config) -> bool:
+    model_path = Path(config.runtime.model_path) if config.runtime.model_path else None
+    return bool(model_path and model_path.exists())
+
+
+def _prepare_missing_runtime(console: MagicConsole, config, hardware=None):
+    console.console.print("[yellow]Model already downloaded. Preparing missing runtime...[/]")
+    if hardware is None:
+        hardware = _diagnose(console)
+    try:
+        with console.task("Preparing llama.cpp server runtime") as status:
+            status.update("Looking for llama-server")
+            llama_path = str(ensure_llama_server_binary(hardware, auto_download=True))
+            status.update(f"Runtime ready: {llama_path}")
+    except LlamaBinaryError as exc:
+        console.console.print(f"[red]Runtime preparation failed:[/] {exc}")
+        return None
+    config = merge_runtime(config, {"llama_server_path": llama_path})
+    save_config(config)
+    console.console.print("[green]Runtime configured.[/]")
+    return config
+
+
 def _diagnose(console: MagicConsole):
     with console.task("Scanning CPU, RAM, GPU and VRAM") as status:
         status.update("Reading local hardware sensors")
@@ -192,18 +222,51 @@ def cmd_init(args: argparse.Namespace) -> int:
     save_config(config)
     console.console.print(f"[green]Configuration written:[/] {CONFIG_PATH}")
 
-    if args.start and config.runtime.model_path and config.runtime.llama_server_path:
-        return cmd_run(args)
+    if args.start:
+        if config.runtime.model_path and config.runtime.llama_server_path:
+            console.console.print("[green]Configuration complete. Starting Magic Claw supervisor...[/]")
+            return cmd_run(args)
+        console.console.print(
+            "[yellow]Configuration saved, but the runtime is incomplete. "
+            "Fix the warning above, then run `python -m magic_claw run`.[/]"
+        )
+        return 5
+    if config.runtime.model_path and config.runtime.llama_server_path:
+        console.console.print("[green]Configuration complete. Run `python -m magic_claw run` to start H24 mode.[/]")
+    else:
+        console.console.print("[yellow]Configuration saved, but runtime startup is not ready yet.[/]")
     return 0
 
 
-def cmd_run(_args: argparse.Namespace) -> int:
-    console = MagicConsole()
-    console.print_header()
-    config = load_config()
+def _run_supervisor(console: MagicConsole, config) -> int:
     if not config.runtime.model_path:
         console.console.print("[red]No model configured. Run `python -m magic_claw init` first.[/]")
         return 2
+    if not config.runtime.llama_server_path:
+        if _model_ready(config):
+            repaired = _prepare_missing_runtime(console, config)
+            if repaired is None:
+                return 5
+            config = repaired
+        else:
+            console.console.print("[red]No llama-server runtime configured. Run init again without --no-runtime.[/]")
+            return 2
+
+    llama_path = Path(config.runtime.llama_server_path)
+    if not llama_path.exists():
+        if _model_ready(config):
+            repaired = _prepare_missing_runtime(console, config)
+            if repaired is None:
+                return 5
+            config = repaired
+        else:
+            console.console.print(f"[red]Configured llama-server runtime was not found:[/] {llama_path}")
+            return 2
+
+    if not Path(config.runtime.model_path).exists():
+        console.console.print(f"[red]Configured model was not found:[/] {config.runtime.model_path}")
+        return 2
+
     if not config.runtime.llama_server_path:
         console.console.print("[red]No llama-server runtime configured. Run init again without --no-runtime.[/]")
         return 2
@@ -213,6 +276,41 @@ def cmd_run(_args: argparse.Namespace) -> int:
         supervisor.on_status = lambda message: status.update(message)
         supervisor.run_forever()
     return 0
+
+
+def cmd_boot(_args: argparse.Namespace) -> int:
+    console = MagicConsole()
+    config = load_config()
+
+    if _runtime_ready():
+        console.print_header()
+        return _run_supervisor(console, config)
+
+    if _model_ready(config):
+        console.print_header()
+        repaired = _prepare_missing_runtime(console, config)
+        if repaired is None:
+            return 5
+        console.console.print("[green]Starting Magic Claw supervisor...[/]")
+        return _run_supervisor(console, repaired)
+
+    return cmd_init(
+        argparse.Namespace(
+            no_download=False,
+            no_runtime=False,
+            start=True,
+            telegram_token=None,
+            enable_telegram=False,
+            telegram_user_id=None,
+        )
+    )
+
+
+def cmd_run(_args: argparse.Namespace) -> int:
+    console = MagicConsole()
+    console.print_header()
+    config = load_config()
+    return _run_supervisor(console, config)
 
 
 def cmd_task(args: argparse.Namespace) -> int:
@@ -265,9 +363,9 @@ def main(argv: list[str] | None = None) -> int:
     load_dotenv(ENV_PATH)
     parser = build_parser()
     args = parser.parse_args(argv)
-    if not args.command:
-        args = parser.parse_args(["init"])
     try:
+        if not args.command:
+            return cmd_boot(args)
         return int(args.func(args))
     except KeyboardInterrupt:
         print("Interrupted.")
