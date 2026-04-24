@@ -83,6 +83,24 @@ class AgentLoop:
                 return json.loads(raw[start : end + 1])
             raise
 
+    def _describe_tool(self, tool: str, args: dict[str, Any]) -> str:
+        if tool == "list_dir":
+            return f"Listing folder: {args.get('path', '.')}"
+        if tool == "read_file":
+            return f"Reading file: {args.get('path', '')}"
+        if tool == "write_file":
+            return f"Writing file: {args.get('path', '')}"
+        if tool == "make_dir":
+            return f"Creating folder: {args.get('path', '')}"
+        if tool == "search_files":
+            return f"Searching files: {args.get('query', '')}"
+        if tool == "run_shell":
+            command = str(args.get("command", ""))
+            if len(command) > 80:
+                command = command[:77] + "..."
+            return f"Running command: {command}"
+        return f"Running tool: {tool}"
+
     def run(self, prompt: str, max_steps: int = 40) -> AgentResult:
         task_id = self.state.create_task(prompt)
         messages = [
@@ -93,7 +111,7 @@ class AgentLoop:
 
         try:
             for step in range(1, max_steps + 1):
-                self.on_status(f"Step {step}/{max_steps}: asking model for next action")
+                self.on_status(f"Thinking | step {step}/{max_steps}")
                 raw = self.client.complete(messages)
                 self.state.add_step(task_id, step, "assistant_raw", raw)
 
@@ -115,10 +133,11 @@ class AgentLoop:
 
                 if tool == "final":
                     answer = str(args.get("answer", "Task complete."))
+                    self.on_status("Finalizing response")
                     self.state.finish_task(task_id, answer)
                     return AgentResult(task_id=task_id, status="done", answer=answer)
 
-                self.on_status(f"Step {step}/{max_steps}: executing tool {tool}")
+                self.on_status(f"{self._describe_tool(tool, args)} | step {step}/{max_steps}")
                 try:
                     observation = self.tools.execute(tool, args)
                 except (ToolError, TypeError, OSError, subprocess.SubprocessError) as exc:  # type: ignore[name-defined]

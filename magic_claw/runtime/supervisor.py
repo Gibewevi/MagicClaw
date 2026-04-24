@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from magic_claw.agent import AgentLoop
+from magic_claw.agent.loop import AgentResult
 from magic_claw.config import MagicConfig
 from magic_claw.state import StateStore
 from magic_claw.telegram import TelegramBot
@@ -42,18 +43,21 @@ class Supervisor:
             "Magic Claw status\n"
             f"model_healthy: {status.model_healthy}\n"
             f"telegram_enabled: {status.telegram_enabled}\n"
-            f"restarts: {status.restarts}\n"
-            f"api_base: {self.config.runtime.api_base}"
+            f"restarts: {status.restarts}"
         )
 
-    def run_agent_task(self, prompt: str) -> str:
+    def run_agent_task_result(self, prompt: str, max_steps: int = 40, on_status=None) -> AgentResult:
+        status_callback = on_status or self.on_status
         loop = AgentLoop(
             self.config.runtime,
             self.config.workspace_dir,
             self.state,
-            on_status=self.on_status,
+            on_status=status_callback,
         )
-        result = loop.run(prompt)
+        return loop.run(prompt, max_steps=max_steps)
+
+    def run_agent_task(self, prompt: str) -> str:
+        result = self.run_agent_task_result(prompt)
         return result.answer
 
     def _start_telegram_thread(self) -> threading.Thread | None:
@@ -77,24 +81,37 @@ class Supervisor:
             return name[:25] + "..."
         return name
 
+    def start_model_server(self, timeout_seconds: int = 240) -> None:
+        model_label = self._model_label()
+        startup_prefix = f"Loading {model_label}"
+        self.on_status(f"Starting {model_label}")
+        self.server.start()
+        self.on_status(f"{startup_prefix} | waiting for API | 0s")
+        if not self.server.wait_until_ready(
+            timeout_seconds=timeout_seconds,
+            on_status=self.on_status,
+            status_prefix=startup_prefix,
+        ):
+            raise RuntimeError("Model server did not become ready.")
+        self.state.event("info", "supervisor", "model server ready")
+        self.on_status(f"Ready | {model_label}")
+
+    def ensure_model_server_ready(self, timeout_seconds: int = 240) -> None:
+        if self.server.healthy(timeout_seconds=2):
+            return
+        self.server.stop()
+        self.start_model_server(timeout_seconds=timeout_seconds)
+
+    def stop(self) -> None:
+        self.stop_event.set()
+        self.server.stop()
+
     def run_forever(self) -> None:
         backoff = 2.0
         telegram_thread: threading.Thread | None = None
         while not self.stop_event.is_set():
             try:
-                model_label = self._model_label()
-                startup_prefix = f"Loading {model_label}"
-                self.on_status(f"Starting {model_label}")
-                self.server.start()
-                self.on_status(f"{startup_prefix} | waiting for API | 0s")
-                if not self.server.wait_until_ready(
-                    timeout_seconds=240,
-                    on_status=self.on_status,
-                    status_prefix=startup_prefix,
-                ):
-                    raise RuntimeError("Model server did not become ready.")
-                self.state.event("info", "supervisor", "model server ready")
-                self.on_status(f"Ready | {model_label}")
+                self.start_model_server(timeout_seconds=240)
                 if telegram_thread is None:
                     telegram_thread = self._start_telegram_thread()
 
@@ -102,8 +119,7 @@ class Supervisor:
                 while not self.stop_event.is_set():
                     if not self.server.healthy(timeout_seconds=5):
                         raise RuntimeError("Model healthcheck failed.")
-                    telegram_state = "on" if self.config.telegram.enabled else "off"
-                    self.on_status(f"Ready | Telegram {telegram_state} | restarts {self.restarts}")
+                    self.on_status(f"Ready | restarts {self.restarts}")
                     time.sleep(10)
             except KeyboardInterrupt:
                 self.stop_event.set()

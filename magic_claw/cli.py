@@ -20,6 +20,9 @@ from .state import StateStore
 from .ui import MagicConsole
 
 
+EXIT_COMMANDS = {"exit", "quit", "q", "stop"}
+
+
 def _runtime_ready() -> bool:
     config = load_config()
     model_path = Path(config.runtime.model_path) if config.runtime.model_path else None
@@ -271,10 +274,49 @@ def _run_supervisor(console: MagicConsole, config) -> int:
         console.console.print("[red]No llama-server runtime configured. Run init again without --no-runtime.[/]")
         return 2
 
-    supervisor = Supervisor(config, on_status=lambda message: console.console.print(f"[cyan]*[/] {message}"))
-    with console.task("Magic Claw supervisor running") as status:
-        supervisor.on_status = lambda message: status.update(message)
-        supervisor.run_forever()
+    supervisor = Supervisor(config)
+    try:
+        with console.task("Starting local model") as status:
+            supervisor.on_status = lambda message: status.update(message)
+            supervisor.start_model_server(timeout_seconds=240)
+
+        model_name = Path(config.runtime.model_path).stem
+        console.console.print(f"[green]Model ready:[/] {model_name}")
+        console.console.print("Type a task and press Enter. Type [cyan]exit[/] to stop.")
+
+        while True:
+            try:
+                prompt = console.console.input("\n[bold cyan]Magic Claw > [/]").strip()
+            except EOFError:
+                break
+
+            if not prompt:
+                continue
+            if prompt.lower() in EXIT_COMMANDS:
+                break
+
+            with console.task("Processing task") as status:
+                supervisor.on_status = lambda message: status.update(message)
+                try:
+                    supervisor.ensure_model_server_ready(timeout_seconds=240)
+                    result = supervisor.run_agent_task_result(
+                        prompt,
+                        max_steps=40,
+                        on_status=lambda message: status.update(message),
+                    )
+                except Exception as exc:
+                    status.update("Task failed")
+                    console.console.print(f"[red]Task failed:[/] {exc}")
+                    continue
+
+            if result.status == "done":
+                console.console.print(f"[green]{result.answer}[/]")
+            else:
+                console.console.print(f"[red]{result.answer}[/]")
+    finally:
+        supervisor.stop()
+
+    console.console.print("[yellow]Magic Claw stopped.[/]")
     return 0
 
 
@@ -350,7 +392,7 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--telegram-user-id", action="append", type=int, help="Allowed Telegram user id; repeatable")
     init_parser.set_defaults(func=cmd_init)
 
-    sub.add_parser("run", help="Run H24 supervisor").set_defaults(func=cmd_run)
+    sub.add_parser("run", help="Start the local terminal agent").set_defaults(func=cmd_run)
 
     task_parser = sub.add_parser("task", help="Run one agent task against the configured local model")
     task_parser.add_argument("prompt")
