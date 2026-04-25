@@ -94,6 +94,12 @@ class AgentToolbox:
             env.setdefault("YES", "1")
         return env
 
+    def _shell_stdin(self, command: str) -> str | None:
+        lowered = command.lower()
+        if "create-vite" in lowered or "npm create vite" in lowered or "npm init vite" in lowered:
+            return "n\n"
+        return None
+
     def _validate_shell_command(self, command: str) -> None:
         match = re.search(
             r"(?:npm\s+(?:create|init)\s+vite(?:@latest)?|create-vite)\s+([^\s]+)",
@@ -133,6 +139,7 @@ class AgentToolbox:
                 shell=True,
                 capture_output=True,
                 text=True,
+                input=self._shell_stdin(command),
                 timeout=timeout_seconds,
                 env=self._shell_env(command),
             )

@@ -98,3 +98,11 @@ def test_run_shell_rejects_non_empty_vite_target(tmp_path):
         assert "not empty" in str(exc)
     else:
         raise AssertionError("Expected non-empty Vite target to be rejected")
+
+
+def test_vite_scaffolding_gets_non_interactive_stdin(tmp_path):
+    toolbox = AgentToolbox(tmp_path)
+
+    assert toolbox._shell_stdin("npm create vite@latest meteo-landing -- --template react") == "n\n"
+    assert toolbox._shell_stdin("npx create-vite@latest meteo-landing --template react") == "n\n"
+    assert toolbox._shell_stdin("npm install") is None
