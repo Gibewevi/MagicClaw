@@ -14,6 +14,12 @@ from magic_claw.config import RuntimeSettings
 from magic_claw.state import StateStore
 
 from .tools import AgentToolbox, ToolError
+from .workspace import (
+    active_project_from_observation,
+    remember_active_project,
+    resolve_workspace_focus,
+    workspace_contract_prompt,
+)
 
 
 SYSTEM_PROMPT = """You are Magic Claw, a local autonomous coding and operations agent.
@@ -166,6 +172,7 @@ class AgentLoop:
         on_status: Callable[[str], None] | None = None,
     ) -> None:
         self.client = LocalModelClient(settings)
+        self.workspace_dir = workspace_dir
         self.tools = AgentToolbox(workspace_dir)
         self.state = state
         self.on_status = on_status or (lambda _message: None)
@@ -224,9 +231,12 @@ class AgentLoop:
         return f"Running tool: {tool}"
 
     def run(self, prompt: str, max_steps: int = 60) -> AgentResult:
+        focus = resolve_workspace_focus(prompt, self.workspace_dir, self.state)
+        self.tools.set_active_project(focus.active_project)
         task_id = self.state.create_task(prompt)
         messages = [
             {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "system", "content": workspace_contract_prompt(focus)},
             {"role": "user", "content": prompt},
         ]
         invalid_json_retries = 0
@@ -277,6 +287,19 @@ class AgentLoop:
                 observation_text = json.dumps(observation, ensure_ascii=False)[:24000]
                 if "error" not in observation and not observation.get("timed_out"):
                     completed_tools.append(tool)
+                    new_active = active_project_from_observation(
+                        observation,
+                        self.workspace_dir,
+                        current_active=focus.active_project,
+                    )
+                    if new_active:
+                        remember_active_project(self.state, focus.workspace, new_active)
+                        focus = resolve_workspace_focus(prompt, self.workspace_dir, self.state)
+                        self.tools.set_active_project(focus.active_project)
+                        active = focus.active_relative or new_active.name
+                        observation_text = observation_text[:23500] + (
+                            f'\nWorkspace focus set to active project: "{active}".'
+                        )
                 self.state.add_step(task_id, step, "observation", observation_text)
                 messages.append({"role": "assistant", "content": json.dumps(action)})
                 messages.append({"role": "user", "content": f"Observation: {observation_text}"})

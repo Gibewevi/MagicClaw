@@ -6,25 +6,73 @@ import subprocess
 from pathlib import Path
 from typing import Any
 
+from .workspace import vite_scaffold_target
+
 
 class ToolError(RuntimeError):
     pass
 
 
 class AgentToolbox:
-    def __init__(self, workspace: str | Path) -> None:
+    def __init__(self, workspace: str | Path, active_project: str | Path | None = None) -> None:
         self.workspace = Path(workspace).resolve()
         self.workspace.mkdir(parents=True, exist_ok=True)
+        self.active_project: Path | None = None
+        if active_project:
+            self.set_active_project(active_project)
+
+    @property
+    def working_dir(self) -> Path:
+        return self.active_project or self.workspace
+
+    @property
+    def active_project_name(self) -> str | None:
+        return self.active_project.name if self.active_project else None
+
+    def set_active_project(self, active_project: str | Path | None) -> None:
+        if active_project is None:
+            self.active_project = None
+            return
+        raw = Path(active_project)
+        resolved = raw.resolve() if raw.is_absolute() else (self.workspace / raw).resolve()
+        try:
+            resolved.relative_to(self.workspace)
+        except ValueError:
+            raise ToolError(f"Active project escapes workspace: {active_project}")
+        resolved.mkdir(parents=True, exist_ok=True)
+        self.active_project = resolved
+
+    def _base_path_for(self, raw: Path) -> Path:
+        if raw.is_absolute():
+            return raw
+        if self.active_project:
+            parts = raw.parts
+            if parts and parts[0].casefold() == self.active_project.name.casefold():
+                raw = Path(*parts[1:]) if len(parts) > 1 else Path(".")
+            return self.active_project / raw
+        return self.workspace / raw
 
     def _safe_path(self, relative_path: str) -> Path:
         raw = Path(relative_path)
-        path = raw if raw.is_absolute() else self.workspace / raw
+        path = self._base_path_for(raw)
         resolved = path.resolve()
         try:
             resolved.relative_to(self.workspace)
         except ValueError:
             raise ToolError(f"Path escapes workspace: {relative_path}")
         return resolved
+
+    def _ensure_active_write(self, target: Path, requested_path: str) -> None:
+        if not self.active_project:
+            return
+        try:
+            target.relative_to(self.active_project)
+        except ValueError:
+            active = self.active_project.relative_to(self.workspace).as_posix()
+            raise ToolError(
+                f"Write target escapes active project '{active}': {requested_path}. "
+                "Continue inside the active project instead of creating a sibling project."
+            )
 
     def list_dir(self, path: str = ".") -> dict[str, Any]:
         target = self._safe_path(path)
@@ -53,12 +101,14 @@ class AgentToolbox:
 
     def write_file(self, path: str, content: str) -> dict[str, Any]:
         target = self._safe_path(path)
+        self._ensure_active_write(target, path)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(content, encoding="utf-8")
         return {"path": str(target), "bytes": target.stat().st_size}
 
     def make_dir(self, path: str) -> dict[str, Any]:
         target = self._safe_path(path)
+        self._ensure_active_write(target, path)
         target.mkdir(parents=True, exist_ok=True)
         return {"path": str(target)}
 
@@ -101,15 +151,26 @@ class AgentToolbox:
         return None
 
     def _validate_shell_command(self, command: str) -> None:
-        match = re.search(
-            r"(?:npm\s+(?:create|init)\s+vite(?:@latest)?|create-vite)\s+([^\s]+)",
-            command,
-            flags=re.IGNORECASE,
-        )
-        if not match:
+        lowered = command.lower()
+        project_name = vite_scaffold_target(command)
+        if self.active_project and project_name:
+            if Path(project_name) == Path("."):
+                return
+            active = self.active_project.relative_to(self.workspace).as_posix()
+            raise ToolError(
+                f"Active project is '{active}'. Do not scaffold a new Vite project '{project_name}'. "
+                "Initialize or update the active project in place, then verify it."
+            )
+        if self.active_project and "npm init" in lowered:
+            if re.search(r"\b(?:cd|mkdir(?:\s+-p)?)\s+[a-z0-9][a-z0-9_-]*", lowered):
+                active = self.active_project.relative_to(self.workspace).as_posix()
+                raise ToolError(
+                    f"Active project is '{active}'. Run npm initialization in that project root, "
+                    "not in a newly created subfolder."
+                )
+        if not project_name:
             return
 
-        project_name = match.group(1).strip("\"'")
         if project_name.startswith("-"):
             raise ToolError("Vite project name is missing; provide a non-interactive ASCII folder name.")
         if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", project_name):
@@ -135,7 +196,7 @@ class AgentToolbox:
         try:
             proc = subprocess.run(
                 command,
-                cwd=self.workspace,
+                cwd=self.working_dir,
                 shell=True,
                 capture_output=True,
                 text=True,
