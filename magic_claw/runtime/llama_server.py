@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+import os
 import re
 import subprocess
 import time
@@ -31,12 +32,22 @@ class LlamaServer:
     def process_id(self) -> int | None:
         return self.process.pid if self.process else None
 
+    def _runtime_dir(self) -> Path:
+        return Path(self.settings.llama_server_path).resolve().parent
+
+    def _environment(self) -> dict[str, str]:
+        env = os.environ.copy()
+        runtime_dir = str(self._runtime_dir())
+        env["PATH"] = runtime_dir + os.pathsep + env.get("PATH", "")
+        return env
+
     def command(self) -> list[str]:
         if not self.settings.llama_server_path:
             raise RuntimeError("llama_server_path is not configured.")
         if not self.settings.model_path:
             raise RuntimeError("model_path is not configured.")
-        return [
+        gpu_layers = "all" if self.settings.gpu_layers < 0 else str(self.settings.gpu_layers)
+        command = [
             self.settings.llama_server_path,
             "--model",
             self.settings.model_path,
@@ -55,9 +66,19 @@ class LlamaServer:
             "--parallel",
             str(self.settings.parallel),
             "--n-gpu-layers",
-            str(self.settings.gpu_layers),
+            gpu_layers,
+            "--timeout",
+            str(self.settings.server_timeout_seconds),
+            "--flash-attn",
+            self.settings.flash_attention,
+            "--reasoning",
+            self.settings.reasoning,
+            "--reasoning-budget",
+            str(self.settings.reasoning_budget_tokens),
             "--cont-batching",
         ]
+        command.append("--kv-offload" if self.settings.kv_offload else "--no-kv-offload")
+        return command
 
     def start(self) -> None:
         ensure_dirs()
@@ -74,7 +95,8 @@ class LlamaServer:
             stdout=stdout,
             stderr=stderr,
             text=True,
-            cwd=str(Path(self.settings.model_path).parent),
+            cwd=str(self._runtime_dir()),
+            env=self._environment(),
         )
 
     def stop(self) -> None:

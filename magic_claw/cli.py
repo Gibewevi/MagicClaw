@@ -8,19 +8,30 @@ from dotenv import load_dotenv
 from rich.markup import escape
 from rich.prompt import Confirm, IntPrompt
 
-from .agent import AgentLoop
 from .config import load_config, merge_runtime, save_config
 from .hardware import diagnose_hardware
 from .models import compatible_model_plans, recommended_models
 from .models.downloader import ModelResolutionError, download_model, resolve_model_file
 from .paths import CONFIG_PATH, ENV_PATH, ensure_dirs
-from .runtime.llama_binary import LlamaBinaryError, ensure_llama_server_binary
+from .runtime.llama_binary import LlamaBinaryError, ensure_llama_runtime_dependencies, ensure_llama_server_binary
 from .runtime.supervisor import Supervisor
-from .state import StateStore
 from .ui import MagicConsole
 
 
 EXIT_COMMANDS = {"exit", "quit", "q", "stop"}
+BUFFER_RUN_COMMANDS = {"go", "lancer", "run", "start"}
+SECTION_HEADINGS = {
+    "but",
+    "contraintes",
+    "constraints",
+    "contexte",
+    "context",
+    "objectif",
+    "objective",
+    "requirements",
+    "tache",
+    "task",
+}
 
 
 def _runtime_ready() -> bool:
@@ -140,6 +151,58 @@ def _download_status(filename: str, downloaded: float, total: float | None) -> s
         percent = min(100.0, max(0.0, downloaded * 100 / total))
         return f"Telechargement {name} - {percent:5.1f}% ({_human_bytes(downloaded)} / {_human_bytes(total)})"
     return f"Telechargement {name} - {_human_bytes(downloaded)}"
+
+
+def _normalise_cli_text(value: str) -> str:
+    import unicodedata
+
+    decomposed = unicodedata.normalize("NFKD", value.casefold())
+    return "".join(char for char in decomposed if not unicodedata.combining(char))
+
+
+def _is_section_heading(value: str) -> bool:
+    normalised = _normalise_cli_text(value).strip().strip(":")
+    return normalised in SECTION_HEADINGS or (value.strip().endswith(":") and len(value.strip()) <= 64)
+
+
+class InteractivePromptBuffer:
+    def __init__(self) -> None:
+        self.parts: list[str] = []
+
+    def add(self, prompt: str) -> tuple[str | None, bool]:
+        stripped = prompt.strip()
+        normalised = _normalise_cli_text(stripped)
+        if self.parts and normalised in BUFFER_RUN_COMMANDS:
+            combined = "\n".join(self.parts)
+            self.parts.clear()
+            return combined, True
+        if stripped.endswith("\\") or stripped.endswith("..."):
+            self.parts.append(stripped.rstrip("\\. "))
+            return None, True
+        if _is_section_heading(stripped):
+            self.parts.append(stripped)
+            return None, True
+        if self.parts:
+            self.parts.append(stripped)
+            combined = "\n".join(self.parts)
+            self.parts.clear()
+            return combined, True
+        return stripped, False
+
+
+def _with_interactive_context(prompt: str, history: list[tuple[str, str]]) -> str:
+    if not history:
+        return prompt
+    recent = history[-3:]
+    context = "\n\n".join(
+        f"Previous user request:\n{old_prompt}\nPrevious result:\n{old_answer}"
+        for old_prompt, old_answer in recent
+    )
+    return (
+        "Interactive context from earlier terminal turns. Use it only when the "
+        "current request is a continuation or asks about earlier work.\n\n"
+        f"{context}\n\nCurrent user request:\n{prompt}"
+    )
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -274,6 +337,11 @@ def _run_supervisor(console: MagicConsole, config) -> int:
         console.console.print("[red]No llama-server runtime configured. Run init again without --no-runtime.[/]")
         return 2
 
+    try:
+        ensure_llama_runtime_dependencies(Path(config.runtime.llama_server_path), diagnose_hardware(), auto_download=True)
+    except LlamaBinaryError as exc:
+        console.console.print(f"[yellow]Runtime dependency warning:[/] {exc}")
+
     supervisor = Supervisor(config)
     try:
         with console.task("Starting local model") as status:
@@ -283,6 +351,8 @@ def _run_supervisor(console: MagicConsole, config) -> int:
         model_name = Path(config.runtime.model_path).stem
         console.console.print(f"[green]Model ready:[/] {model_name}")
         console.console.print("Type a task and press Enter. Type [cyan]exit[/] to stop.")
+        prompt_buffer = InteractivePromptBuffer()
+        history: list[tuple[str, str]] = []
 
         while True:
             try:
@@ -294,14 +364,19 @@ def _run_supervisor(console: MagicConsole, config) -> int:
                 continue
             if prompt.lower() in EXIT_COMMANDS:
                 break
+            buffered_prompt, from_buffer = prompt_buffer.add(prompt)
+            if buffered_prompt is None:
+                console.console.print("[dim]Partial instruction saved; continue with the next line.[/]")
+                continue
 
             with console.task("Processing task") as status:
                 supervisor.on_status = lambda message: status.update(message)
                 try:
                     supervisor.ensure_model_server_ready(timeout_seconds=240)
+                    effective_prompt = _with_interactive_context(buffered_prompt, history)
                     result = supervisor.run_agent_task_result(
-                        prompt,
-                        max_steps=40,
+                        effective_prompt,
+                        max_steps=60,
                         on_status=lambda message: status.update(message),
                     )
                 except Exception as exc:
@@ -311,8 +386,13 @@ def _run_supervisor(console: MagicConsole, config) -> int:
 
             if result.status == "done":
                 console.console.print(f"[green]{result.answer}[/]")
+                history.append((buffered_prompt, result.answer))
+                history = history[-5:]
             else:
                 console.console.print(f"[red]{result.answer}[/]")
+                if from_buffer:
+                    history.append((buffered_prompt, result.answer))
+                    history = history[-5:]
     finally:
         supervisor.stop()
 
@@ -358,17 +438,38 @@ def cmd_run(_args: argparse.Namespace) -> int:
 def cmd_task(args: argparse.Namespace) -> int:
     console = MagicConsole()
     config = load_config()
-    state = StateStore()
     if not config.runtime.model_path:
         console.console.print("[red]No model configured. Run init first.[/]")
         return 2
-    loop = AgentLoop(
-        config.runtime,
-        config.workspace_dir,
-        state,
-        on_status=lambda message: console.console.print(f"[cyan]*[/] {message}"),
-    )
-    result = loop.run(args.prompt, max_steps=args.max_steps)
+    if not Path(config.runtime.model_path).exists():
+        console.console.print(f"[red]Configured model was not found:[/] {config.runtime.model_path}")
+        return 2
+    if not config.runtime.llama_server_path or not Path(config.runtime.llama_server_path).exists():
+        repaired = _prepare_missing_runtime(console, config)
+        if repaired is None:
+            return 5
+        config = repaired
+
+    try:
+        ensure_llama_runtime_dependencies(Path(config.runtime.llama_server_path), diagnose_hardware(), auto_download=True)
+    except LlamaBinaryError as exc:
+        console.console.print(f"[yellow]Runtime dependency warning:[/] {exc}")
+
+    supervisor = Supervisor(config, on_status=lambda message: console.console.print(f"[cyan]*[/] {message}"))
+    try:
+        with console.task("Starting local model") as status:
+            supervisor.on_status = lambda message: status.update(message)
+            supervisor.start_model_server(timeout_seconds=420)
+        result = supervisor.run_agent_task_result(
+            args.prompt,
+            max_steps=args.max_steps,
+            on_status=lambda message: console.console.print(f"[cyan]*[/] {message}"),
+        )
+    except Exception as exc:
+        console.console.print(f"[red]Task failed:[/] {exc}")
+        return 1
+    finally:
+        supervisor.stop()
     if result.status == "done":
         console.console.print(f"[green]{result.answer}[/]")
         return 0
@@ -396,7 +497,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     task_parser = sub.add_parser("task", help="Run one agent task against the configured local model")
     task_parser.add_argument("prompt")
-    task_parser.add_argument("--max-steps", type=int, default=40)
+    task_parser.add_argument("--max-steps", type=int, default=60)
     task_parser.set_defaults(func=cmd_task)
     return parser
 

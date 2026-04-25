@@ -29,6 +29,15 @@ class RuntimeSettings(BaseModel):
     temperature: float = 0.2
     top_p: float = 0.9
     max_tokens: int = 2048
+    step_max_tokens: int = 768
+    request_timeout_seconds: int = 420
+    request_retries: int = 1
+    request_retry_backoff_seconds: float = 2.0
+    server_timeout_seconds: int = 900
+    reasoning: str = "off"
+    reasoning_budget_tokens: int = 0
+    flash_attention: str = "on"
+    kv_offload: bool = True
 
     @property
     def api_base(self) -> str:
@@ -70,4 +79,3 @@ def merge_runtime(config: MagicConfig, values: dict[str, Any]) -> MagicConfig:
     current = config.runtime.model_dump()
     current.update(values)
     return config.model_copy(update={"runtime": RuntimeSettings.model_validate(current)})
-

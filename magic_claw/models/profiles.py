@@ -63,7 +63,7 @@ def _best_context(params_b: float, usable_vram_gb: float, ram_total_gb: float) -
     if params_b >= 30:
         return 8192
     if params_b >= 24:
-        return 8192 if ram_total_gb < 32 else 12288
+        return 12288 if usable_vram_gb >= 18 else 8192
     if params_b >= 14:
         return 16384
     return 32768 if usable_vram_gb >= 18 and ram_total_gb >= 24 else 16384
@@ -122,8 +122,8 @@ def build_runtime_plan(option: ModelOption, hardware: HardwareInfo) -> RuntimePl
         compatibility = "not_recommended"
         reason = "Too close to VRAM/RAM limits for reliable continuous use."
 
-    batch = 512 if option.params_b <= 14 and usable_vram >= 16 else 256
-    ubatch = 128 if batch >= 256 else 64
+    batch = 512 if (option.params_b <= 14 and usable_vram >= 16) or usable_vram >= 18 else 256
+    ubatch = 256 if batch >= 512 and usable_vram >= 20 else 128 if batch >= 256 else 64
 
     return RuntimePlan(
         option=option,

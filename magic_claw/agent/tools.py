@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -19,7 +20,9 @@ class AgentToolbox:
         raw = Path(relative_path)
         path = raw if raw.is_absolute() else self.workspace / raw
         resolved = path.resolve()
-        if not str(resolved).lower().startswith(str(self.workspace).lower()):
+        try:
+            resolved.relative_to(self.workspace)
+        except ValueError:
             raise ToolError(f"Path escapes workspace: {relative_path}")
         return resolved
 
@@ -82,25 +85,70 @@ class AgentToolbox:
                     matches.append(str(item.relative_to(self.workspace)))
         return {"query": query, "matches": matches}
 
-    def run_shell(self, command: str, timeout_seconds: int = 120) -> dict[str, Any]:
-        if timeout_seconds <= 0 or timeout_seconds > 1800:
-            raise ToolError("timeout_seconds must be between 1 and 1800")
+    def _shell_env(self, command: str) -> dict[str, str]:
+        env = os.environ.copy()
+        lowered = command.lower()
+        if any(token in lowered for token in ("npm ", "npx ", "pnpm ", "yarn ", "create-vite")):
+            env.setdefault("CI", "true")
+            env.setdefault("npm_config_yes", "true")
+            env.setdefault("YES", "1")
+        return env
+
+    def _validate_shell_command(self, command: str) -> None:
+        match = re.search(
+            r"(?:npm\s+(?:create|init)\s+vite(?:@latest)?|create-vite)\s+([^\s]+)",
+            command,
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            return
+
+        project_name = match.group(1).strip("\"'")
+        if project_name.startswith("-"):
+            raise ToolError("Vite project name is missing; provide a non-interactive ASCII folder name.")
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]*", project_name):
+            raise ToolError(
+                "Invalid Vite project name for non-interactive npm scaffolding. "
+                "Use lowercase ASCII kebab-case, for example: meteo-vite."
+            )
+        target = self._safe_path(project_name)
+        if target.exists() and any(target.iterdir()):
+            raise ToolError(
+                f"Vite target directory is not empty: {project_name}. "
+                "Choose a new lowercase ASCII folder or explicitly clean the directory first."
+            )
+
+    def run_shell(self, command: str, timeout_seconds: int = 300) -> dict[str, Any]:
+        if timeout_seconds <= 0 or timeout_seconds > 3600:
+            raise ToolError("timeout_seconds must be between 1 and 3600")
         lowered = command.lower()
         blocked = ["format ", "diskpart", "bcdedit", "shutdown", "restart-computer"]
         if any(token in lowered for token in blocked):
             raise ToolError("Command blocked by safety policy.")
-        proc = subprocess.run(
-            command,
-            cwd=self.workspace,
-            shell=True,
-            capture_output=True,
-            text=True,
-            timeout=timeout_seconds,
-            env=os.environ.copy(),
-        )
+        self._validate_shell_command(command)
+        try:
+            proc = subprocess.run(
+                command,
+                cwd=self.workspace,
+                shell=True,
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+                env=self._shell_env(command),
+            )
+        except subprocess.TimeoutExpired as exc:
+            return {
+                "command": command,
+                "returncode": None,
+                "timed_out": True,
+                "timeout_seconds": timeout_seconds,
+                "stdout": _tail_text(exc.stdout, 20000),
+                "stderr": _tail_text(exc.stderr, 12000),
+            }
         return {
             "command": command,
             "returncode": proc.returncode,
+            "timed_out": False,
             "stdout": proc.stdout[-20000:],
             "stderr": proc.stderr[-12000:],
         }
@@ -119,3 +167,12 @@ class AgentToolbox:
             raise ToolError(f"Unknown tool: {tool}")
         return func(**args)
 
+
+def _tail_text(value: str | bytes | None, max_chars: int) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        text = value.decode("utf-8", errors="replace")
+    else:
+        text = value
+    return text[-max_chars:]

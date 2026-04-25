@@ -46,7 +46,7 @@ class Supervisor:
             f"restarts: {status.restarts}"
         )
 
-    def run_agent_task_result(self, prompt: str, max_steps: int = 40, on_status=None) -> AgentResult:
+    def run_agent_task_result(self, prompt: str, max_steps: int = 60, on_status=None) -> AgentResult:
         status_callback = on_status or self.on_status
         loop = AgentLoop(
             self.config.runtime,
