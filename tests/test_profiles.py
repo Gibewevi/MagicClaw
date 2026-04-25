@@ -1,10 +1,13 @@
 from magic_claw.hardware import CpuInfo, GpuInfo, HardwareInfo, MemoryInfo
 from magic_claw.models.catalog import recommended_models
 from magic_claw.models.recent import compatible_model_plans
-from magic_claw.config import RuntimeSettings
+from magic_claw.cli import _apply_dynamic_runtime_tuning
+from magic_claw.config import MagicConfig, RuntimeSettings, merge_runtime
 from magic_claw.runtime.llama_binary import _asset_score, _cuda_dependencies_present, _select_cuda_dependency_asset
 from magic_claw.runtime.llama_server import LlamaServer
 from magic_claw.runtime.llama_server import _friendly_startup_stage, _startup_status
+from magic_claw.models.catalog import get_option
+from magic_claw.models.profiles import build_runtime_plan, generation_token_limits
 
 
 def test_rtx_3090_prefers_mid_sized_models_for_stability():
@@ -45,6 +48,72 @@ def test_compatible_model_plans_filters_unstable_large_models_without_network():
     assert plans
     assert all(plan.compatibility in {"recommended", "compatible"} for plan in plans)
     assert all(plan.option.id != "qwen3.6-35b-a3b" for plan in plans)
+
+
+def test_runtime_plan_derives_generation_limits_from_hardware():
+    hardware = HardwareInfo(
+        os_name="Windows 11",
+        cpu=CpuInfo(name="i7-9700K", physical_cores=8, logical_cores=8, max_freq_mhz=3600),
+        memory=MemoryInfo(total_gb=16.0, available_gb=10.0),
+        gpus=[
+            GpuInfo(
+                name="NVIDIA GeForce RTX 3090",
+                vram_total_mb=24576,
+                vram_used_mb=1800,
+                driver_version="test",
+            )
+        ],
+    )
+
+    plan = build_runtime_plan(get_option("gemma-4-26b-a4b"), hardware)
+
+    assert plan.context_tokens == 12288
+    assert plan.max_tokens == 2048
+    assert plan.step_max_tokens == 2048
+
+
+def test_generation_limits_stay_conservative_without_gpu():
+    hardware = HardwareInfo(
+        os_name="Windows 11",
+        cpu=CpuInfo(name="CPU", physical_cores=8, logical_cores=16, max_freq_mhz=3600),
+        memory=MemoryInfo(total_gb=64.0, available_gb=48.0),
+        gpus=[],
+    )
+
+    limits = generation_token_limits(32768, hardware, params_b=7)
+
+    assert limits.max_tokens == 1024
+    assert limits.step_max_tokens == 1024
+
+
+def test_existing_generated_config_is_retuned_on_startup():
+    hardware = HardwareInfo(
+        os_name="Windows 11",
+        cpu=CpuInfo(name="i7-9700K", physical_cores=8, logical_cores=8, max_freq_mhz=3600),
+        memory=MemoryInfo(total_gb=16.0, available_gb=10.0),
+        gpus=[
+            GpuInfo(
+                name="NVIDIA GeForce RTX 3090",
+                vram_total_mb=24576,
+                vram_used_mb=1800,
+                driver_version="test",
+            )
+        ],
+    )
+    config = merge_runtime(
+        MagicConfig(),
+        {
+            "model_option_id": "gemma-4-26b-a4b",
+            "context_tokens": 12288,
+            "max_tokens": 768,
+            "step_max_tokens": 768,
+        },
+    )
+
+    tuned = _apply_dynamic_runtime_tuning(config, hardware)
+
+    assert tuned.runtime.max_tokens == 2048
+    assert tuned.runtime.step_max_tokens == 2048
 
 
 def test_llama_runtime_selection_ignores_cudart_dependency_archives():

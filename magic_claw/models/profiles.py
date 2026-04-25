@@ -49,6 +49,14 @@ class RuntimePlan:
     gpu_layers: int
     threads: int
     parallel: int
+    max_tokens: int
+    step_max_tokens: int
+
+
+@dataclass(frozen=True)
+class GenerationLimits:
+    max_tokens: int
+    step_max_tokens: int
 
 
 def estimate_vram_gb(params_b: float, quantization: str, context_tokens: int) -> float:
@@ -79,6 +87,28 @@ def _candidate_quants(params_b: float, usable_vram_gb: float) -> list[str]:
     return ["IQ4_XS", "Q4_K_M"]
 
 
+def generation_token_limits(context_tokens: int, hardware: HardwareInfo, params_b: float | None = None) -> GenerationLimits:
+    """Pick bounded per-step generation sizes from the configured context and hardware.
+
+    The agent needs enough output budget to emit valid tool JSON containing source
+    snippets, but the value must remain conservative for long-running local use.
+    """
+    params = params_b or 0
+    if context_tokens >= 32768 and params <= 8 and hardware.stable_usable_vram_gb >= 12:
+        tokens = 3072
+    elif context_tokens >= 12288:
+        tokens = 2048
+    else:
+        tokens = 1024
+
+    if not hardware.primary_gpu or hardware.stable_usable_vram_gb < 8 or hardware.memory.total_gb < 16:
+        tokens = min(tokens, 1024)
+    if params >= 24:
+        tokens = min(tokens, 2048)
+
+    return GenerationLimits(max_tokens=tokens, step_max_tokens=tokens)
+
+
 def build_runtime_plan(option: ModelOption, hardware: HardwareInfo) -> RuntimePlan:
     usable_vram = hardware.stable_usable_vram_gb
     ram_total = hardware.memory.total_gb
@@ -95,18 +125,22 @@ def build_runtime_plan(option: ModelOption, hardware: HardwareInfo) -> RuntimePl
             break
 
     if not hardware.primary_gpu:
+        cpu_context = min(context, 8192)
+        generation = generation_token_limits(cpu_context, hardware, option.params_b)
         return RuntimePlan(
             option=option,
             quantization="Q4_K_M",
             compatibility="not_recommended",
             reason="No NVIDIA GPU detected; CPU-only mode is not stable for this target.",
             estimated_vram_gb=selected_estimate,
-            context_tokens=min(context, 8192),
+            context_tokens=cpu_context,
             batch_size=128,
             ubatch_size=64,
             gpu_layers=0,
             threads=threads,
             parallel=1,
+            max_tokens=generation.max_tokens,
+            step_max_tokens=generation.step_max_tokens,
         )
 
     if selected_estimate <= usable_vram * 0.82 and option.params_b <= 16:
@@ -125,6 +159,8 @@ def build_runtime_plan(option: ModelOption, hardware: HardwareInfo) -> RuntimePl
     batch = 512 if (option.params_b <= 14 and usable_vram >= 16) or usable_vram >= 18 else 256
     ubatch = 256 if batch >= 512 and usable_vram >= 20 else 128 if batch >= 256 else 64
 
+    generation = generation_token_limits(context, hardware, option.params_b)
+
     return RuntimePlan(
         option=option,
         quantization=selected_quant,
@@ -137,4 +173,6 @@ def build_runtime_plan(option: ModelOption, hardware: HardwareInfo) -> RuntimePl
         gpu_layers=-1 if compatibility != "not_recommended" else 0,
         threads=threads,
         parallel=1,
+        max_tokens=generation.max_tokens,
+        step_max_tokens=generation.step_max_tokens,
     )

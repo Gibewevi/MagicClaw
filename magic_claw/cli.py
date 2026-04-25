@@ -10,8 +10,9 @@ from rich.prompt import Confirm, IntPrompt
 
 from .config import load_config, merge_runtime, save_config
 from .hardware import diagnose_hardware
-from .models import compatible_model_plans, recommended_models
+from .models import compatible_model_plans, get_option, recommended_models
 from .models.downloader import ModelResolutionError, download_model, resolve_model_file
+from .models.profiles import generation_token_limits
 from .paths import CONFIG_PATH, ENV_PATH, ensure_dirs
 from .runtime.llama_binary import LlamaBinaryError, ensure_llama_runtime_dependencies, ensure_llama_server_binary
 from .runtime.supervisor import Supervisor
@@ -59,6 +60,7 @@ def _prepare_missing_runtime(console: MagicConsole, config, hardware=None):
         console.console.print(f"[red]Runtime preparation failed:[/] {exc}")
         return None
     config = merge_runtime(config, {"llama_server_path": llama_path})
+    config = _apply_dynamic_runtime_tuning(config, hardware)
     save_config(config)
     console.console.print("[green]Runtime configured.[/]")
     return config
@@ -115,7 +117,7 @@ def _choose_model_plan(console: MagicConsole, plans):
         plan = plans[0]
         console.console.print(
             f"[green]Mode automatique:[/] {plan.option.display_name} "
-            f"({plan.quantization}, contexte {plan.context_tokens})"
+            f"({plan.quantization}, contexte {plan.context_tokens}, step {plan.step_max_tokens})"
         )
         return plan
     console.print_model_plans(plans)
@@ -151,6 +153,24 @@ def _download_status(filename: str, downloaded: float, total: float | None) -> s
         percent = min(100.0, max(0.0, downloaded * 100 / total))
         return f"Telechargement {name} - {percent:5.1f}% ({_human_bytes(downloaded)} / {_human_bytes(total)})"
     return f"Telechargement {name} - {_human_bytes(downloaded)}"
+
+
+def _apply_dynamic_runtime_tuning(config, hardware):
+    option = get_option(config.runtime.model_option_id) if config.runtime.model_option_id else None
+    params_b = option.params_b if option else None
+    generation = generation_token_limits(config.runtime.context_tokens, hardware, params_b)
+    if (
+        config.runtime.max_tokens == generation.max_tokens
+        and config.runtime.step_max_tokens == generation.step_max_tokens
+    ):
+        return config
+    return merge_runtime(
+        config,
+        {
+            "max_tokens": generation.max_tokens,
+            "step_max_tokens": generation.step_max_tokens,
+        },
+    )
 
 
 def _normalise_cli_text(value: str) -> str:
@@ -195,7 +215,10 @@ def _with_interactive_context(prompt: str, history: list[tuple[str, str]]) -> st
         return prompt
     recent = history[-3:]
     context = "\n\n".join(
-        f"Previous user request:\n{old_prompt}\nPrevious result:\n{old_answer}"
+        "Previous user request:\n"
+        f"{_trim_cli_context(old_prompt, 1200)}\n"
+        "Previous result:\n"
+        f"{_trim_cli_context(old_answer, 1600)}"
         for old_prompt, old_answer in recent
     )
     return (
@@ -203,6 +226,16 @@ def _with_interactive_context(prompt: str, history: list[tuple[str, str]]) -> st
         "current request is a continuation or asks about earlier work.\n\n"
         f"{context}\n\nCurrent user request:\n{prompt}"
     )
+
+
+def _trim_cli_context(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    marker = "\n...[historique tronqué]...\n"
+    keep = max(0, max_chars - len(marker))
+    head = keep // 2
+    tail = keep - head
+    return value[:head] + marker + value[-tail:]
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -220,7 +253,8 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     console.console.print(
         f"Selected [bold]{plan.option.display_name}[/] with {plan.quantization}, "
-        f"context {plan.context_tokens}, estimated VRAM {plan.estimated_vram_gb:.1f} GB."
+        f"context {plan.context_tokens}, step {plan.step_max_tokens}, "
+        f"estimated VRAM {plan.estimated_vram_gb:.1f} GB."
     )
     if plan.compatibility == "not_recommended":
         if not Confirm.ask("This model is not recommended for stable H24 use. Continue anyway?", default=False):
@@ -276,6 +310,8 @@ def cmd_init(args: argparse.Namespace) -> int:
             "gpu_layers": plan.gpu_layers,
             "threads": plan.threads,
             "parallel": plan.parallel,
+            "max_tokens": plan.max_tokens,
+            "step_max_tokens": plan.step_max_tokens,
             "llama_server_path": llama_path,
         },
     )
@@ -338,7 +374,10 @@ def _run_supervisor(console: MagicConsole, config) -> int:
         return 2
 
     try:
-        ensure_llama_runtime_dependencies(Path(config.runtime.llama_server_path), diagnose_hardware(), auto_download=True)
+        hardware = diagnose_hardware()
+        config = _apply_dynamic_runtime_tuning(config, hardware)
+        save_config(config)
+        ensure_llama_runtime_dependencies(Path(config.runtime.llama_server_path), hardware, auto_download=True)
     except LlamaBinaryError as exc:
         console.console.print(f"[yellow]Runtime dependency warning:[/] {exc}")
 
@@ -451,7 +490,10 @@ def cmd_task(args: argparse.Namespace) -> int:
         config = repaired
 
     try:
-        ensure_llama_runtime_dependencies(Path(config.runtime.llama_server_path), diagnose_hardware(), auto_download=True)
+        hardware = diagnose_hardware()
+        config = _apply_dynamic_runtime_tuning(config, hardware)
+        save_config(config)
+        ensure_llama_runtime_dependencies(Path(config.runtime.llama_server_path), hardware, auto_download=True)
     except LlamaBinaryError as exc:
         console.console.print(f"[yellow]Runtime dependency warning:[/] {exc}")
 

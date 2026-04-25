@@ -106,6 +106,14 @@ class AgentToolbox:
         target.write_text(content, encoding="utf-8")
         return {"path": str(target), "bytes": target.stat().st_size}
 
+    def append_file(self, path: str, content: str) -> dict[str, Any]:
+        target = self._safe_path(path)
+        self._ensure_active_write(target, path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("a", encoding="utf-8") as handle:
+            handle.write(content)
+        return {"path": str(target), "bytes": target.stat().st_size}
+
     def make_dir(self, path: str) -> dict[str, Any]:
         target = self._safe_path(path)
         self._ensure_active_write(target, path)
@@ -153,6 +161,12 @@ class AgentToolbox:
     def _validate_shell_command(self, command: str) -> None:
         lowered = command.lower()
         project_name = vite_scaffold_target(command)
+        if _is_unbounded_dev_server_command(lowered):
+            raise ToolError(
+                "Long-running dev server command blocked. Use a bounded verification command "
+                "such as `npm run build`, `npm run lint`, `npm test`, `npx playwright test`, "
+                "or a script that starts the server, verifies it, and stops it."
+            )
         if self.active_project and project_name:
             if Path(project_name) == Path("."):
                 return
@@ -223,6 +237,7 @@ class AgentToolbox:
 
     def execute(self, tool: str, args: dict[str, Any]) -> dict[str, Any]:
         mapping = {
+            "append_file": self.append_file,
             "list_dir": self.list_dir,
             "read_file": self.read_file,
             "write_file": self.write_file,
@@ -244,3 +259,16 @@ def _tail_text(value: str | bytes | None, max_chars: int) -> str:
     else:
         text = value
     return text[-max_chars:]
+
+
+def _is_unbounded_dev_server_command(lowered_command: str) -> bool:
+    command = re.sub(r"\s+", " ", lowered_command.strip())
+    command = re.sub(r"^(?:cmd\.exe\s+/[a-z]\s+/[a-z]\s+/c\s+)+", "", command)
+    long_running_patterns = (
+        r"npm run dev(?: -- .*)?",
+        r"pnpm run dev(?: -- .*)?",
+        r"yarn dev(?: .*)?",
+        r"vite(?: .*)?",
+        r"npx vite(?: .*)?",
+    )
+    return any(re.fullmatch(pattern, command) for pattern in long_running_patterns)

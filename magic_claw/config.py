@@ -28,8 +28,8 @@ class RuntimeSettings(BaseModel):
     keepalive_seconds: int = 3600
     temperature: float = 0.2
     top_p: float = 0.9
-    max_tokens: int = 2048
-    step_max_tokens: int = 768
+    max_tokens: int = 1024
+    step_max_tokens: int = 1024
     request_timeout_seconds: int = 420
     request_retries: int = 1
     request_retry_backoff_seconds: float = 2.0

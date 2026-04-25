@@ -64,6 +64,7 @@ class MagicConsole:
         table.add_column("Status", no_wrap=True)
         table.add_column("Quant", no_wrap=True)
         table.add_column("Ctx", justify="right", no_wrap=True)
+        table.add_column("Step", justify="right", no_wrap=True)
         table.add_column("Est. VRAM", justify="right", no_wrap=True)
         table.add_column("Source", no_wrap=True)
         table.add_column("Reason")
@@ -82,6 +83,7 @@ class MagicConsole:
                 f"[{color}]{plan.compatibility}[/]",
                 plan.quantization,
                 str(plan.context_tokens),
+                str(plan.step_max_tokens),
                 f"{plan.estimated_vram_gb:.1f} GB",
                 plan.option.source,
                 plan.reason,
