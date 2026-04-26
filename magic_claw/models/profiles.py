@@ -94,14 +94,16 @@ def generation_token_limits(context_tokens: int, hardware: HardwareInfo, params_
     snippets, but the value must remain conservative for long-running local use.
     """
     params = params_b or 0
-    if context_tokens >= 32768 and params <= 8 and hardware.stable_usable_vram_gb >= 12:
+    if context_tokens >= 32768 and params <= 8 and hardware.stable_usable_vram_gb >= 20 and hardware.memory.total_gb >= 32:
+        tokens = 4096
+    elif context_tokens >= 32768 and params <= 8 and hardware.stable_usable_vram_gb >= 12:
         tokens = 3072
-    elif context_tokens >= 12288:
+    elif context_tokens >= 8192 and hardware.primary_gpu and hardware.stable_usable_vram_gb >= 6:
         tokens = 2048
     else:
         tokens = 1024
 
-    if not hardware.primary_gpu or hardware.stable_usable_vram_gb < 8 or hardware.memory.total_gb < 16:
+    if not hardware.primary_gpu or hardware.stable_usable_vram_gb < 6:
         tokens = min(tokens, 1024)
     if params >= 24:
         tokens = min(tokens, 2048)

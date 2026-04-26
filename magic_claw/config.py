@@ -33,6 +33,8 @@ class RuntimeSettings(BaseModel):
     request_timeout_seconds: int = 420
     request_retries: int = 1
     request_retry_backoff_seconds: float = 2.0
+    step_compaction_max_cycles: int = 12
+    step_compaction_tail_messages: int = 8
     server_timeout_seconds: int = 900
     reasoning: str = "off"
     reasoning_budget_tokens: int = 0
@@ -47,6 +49,10 @@ class RuntimeSettings(BaseModel):
 class TelegramSettings(BaseModel):
     enabled: bool = False
     bot_token_env: str = "MAGIC_CLAW_TELEGRAM_TOKEN"
+    bot_id: int | None = None
+    bot_username: str = ""
+    bot_first_name: str = ""
+    last_validated_at: str = ""
     allow_user_ids: list[int] = Field(default_factory=list)
     poll_timeout_seconds: int = 30
 

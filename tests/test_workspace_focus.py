@@ -57,6 +57,7 @@ def test_toolbox_maps_prefixed_paths_to_active_project_root(tmp_path):
     toolbox = AgentToolbox(workspace, active_project="Meteo")
 
     toolbox.write_file("Meteo/index.html", "ok")
+    toolbox.commit_file("Meteo/index.html")
 
     assert (active / "index.html").read_text(encoding="utf-8") == "ok"
     assert not (active / "Meteo").exists()

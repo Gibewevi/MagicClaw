@@ -35,6 +35,8 @@ python -m magic_claw              # interactive plug and play startup
 python -m magic_claw diagnose     # hardware report
 python -m magic_claw models       # search recent GGUF models and show compatible choices
 python -m magic_claw init         # choose automatic or manual model selection
+python -m magic_claw telegram     # show Telegram control status
+python -m magic_claw telegram setup
 python -m magic_claw run          # start supervisor
 python -m magic_claw task "..."   # run one local agent task
 ```
@@ -46,13 +48,23 @@ GPU/RAM profile, then offers:
 - Automatic: selects the strongest stable model for the machine.
 - Manual: displays the compatible/recommended model list.
 
-Telegram can be enabled during setup without editing files:
+On first setup, Magic Claw asks whether you want Telegram control after model
+selection. If enabled, paste the bot token created with Telegram's BotFather.
+Magic Claw validates the token with Telegram before saving it.
+
+Telegram can also be configured later without editing files:
 
 ```powershell
-python -m magic_claw init --telegram-token "123:abc" --telegram-user-id 123456789
+python -m magic_claw telegram setup
+python -m magic_claw telegram status
+python -m magic_claw telegram disable
+python -m magic_claw telegram reset
 ```
 
-The token is stored in `.magicclaw/.env`, not in the generated JSON config.
+The token is stored in `.magicclaw/.env`; enabled/disabled state and bot metadata
+are stored in `.magicclaw/config.generated.json`. When configured, `run` starts
+Telegram polling and the terminal prompt at the same time. In Telegram, send
+`/help`, `/status`, or any task message.
 
 ## Stability rules
 
@@ -61,4 +73,6 @@ The token is stored in `.magicclaw/.env`, not in the generated JSON config.
 - no runtime edits to source files
 - model process is isolated from the agent process
 - every tool call is checkpointed before the next step
-- shell calls always have timeouts
+- reaching the step window creates a durable continuation memory and resumes
+- shell calls always have absolute timeouts; npm-like commands also have an
+  inactivity watchdog and process-tree termination

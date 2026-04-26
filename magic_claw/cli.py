@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 from rich.markup import escape
-from rich.prompt import Confirm, IntPrompt
+from rich.prompt import Confirm, IntPrompt, Prompt
 
 from .config import load_config, merge_runtime, save_config
 from .hardware import diagnose_hardware
@@ -16,6 +17,16 @@ from .models.profiles import generation_token_limits
 from .paths import CONFIG_PATH, ENV_PATH, ensure_dirs
 from .runtime.llama_binary import LlamaBinaryError, ensure_llama_runtime_dependencies, ensure_llama_server_binary
 from .runtime.supervisor import Supervisor
+from .status import AgentStatusView
+from .telegram import (
+    TelegramSetupError,
+    apply_telegram_bot_info,
+    disable_telegram,
+    reset_telegram,
+    save_telegram_token,
+    set_telegram_bot_commands,
+    verify_telegram_token,
+)
 from .ui import MagicConsole
 
 
@@ -238,6 +249,81 @@ def _trim_cli_context(value: str, max_chars: int) -> str:
     return value[:head] + marker + value[-tail:]
 
 
+def _terminal_task_status_callback(console: MagicConsole, rich_status, prompt: str):
+    status_view = AgentStatusView(prompt)
+    last_line = ""
+    header_printed = False
+
+    def update(message: str) -> None:
+        nonlocal last_line, header_printed
+        snapshot = status_view.update(message)
+        rich_status.update(f"[bold cyan]{escape(snapshot.current)}[/]")
+        if not header_printed:
+            console.console.print(f"[bold cyan]Task:[/] [dim]{escape(snapshot.task)}[/]")
+            header_printed = True
+        if snapshot.line != last_line:
+            timestamp, action = snapshot.latest
+            prefix = f"{timestamp} | " if timestamp else ""
+            console.console.print(f"[dim]{prefix}{escape(action)}[/]")
+            last_line = snapshot.line
+
+    return update
+
+
+def _telegram_token_configured(config) -> bool:
+    key = config.telegram.bot_token_env or "MAGIC_CLAW_TELEGRAM_TOKEN"
+    return bool(os.environ.get(key, "").strip())
+
+
+def _activate_telegram_from_token(console: MagicConsole, config, token: str, user_ids: list[int] | None = None):
+    with console.task("Validation du bot Telegram") as status:
+        status.update("Verification du token avec Telegram")
+        bot_info = verify_telegram_token(token)
+        status.update(f"Bot valide: @{bot_info.username}")
+        save_telegram_token(token, key=config.telegram.bot_token_env or "MAGIC_CLAW_TELEGRAM_TOKEN")
+        commands_ok = set_telegram_bot_commands(token)
+    config = apply_telegram_bot_info(config, bot_info, allow_user_ids=user_ids)
+    console.console.print(f"[green]Telegram active:[/] @{bot_info.username}")
+    if not commands_ok:
+        console.console.print("[yellow]Le bot est connecte, mais les commandes /help et /status n'ont pas pu etre publiees.[/]")
+    return config
+
+
+def _prompt_telegram_setup(console: MagicConsole, config, user_ids: list[int] | None = None):
+    console.console.print("[bold]Configuration Telegram[/]")
+    console.console.print("Cree un bot dans Telegram avec [cyan]@BotFather[/], puis copie le token ici.")
+    console.console.print("Le token ressemble a [dim]123456789:ABCdef...[/].")
+    while True:
+        token = Prompt.ask("Token du bot Telegram", password=True).strip()
+        if not token:
+            console.console.print("[yellow]Configuration Telegram ignoree.[/]")
+            return disable_telegram(config)
+        try:
+            return _activate_telegram_from_token(console, config, token, user_ids=user_ids)
+        except TelegramSetupError as exc:
+            console.console.print(f"[red]Telegram non configure:[/] {exc}")
+            if not Confirm.ask("Reessayer ?", default=True):
+                return disable_telegram(config)
+
+
+def _configure_telegram_during_init(console: MagicConsole, config, args: argparse.Namespace):
+    user_ids = getattr(args, "telegram_user_id", None)
+    token = getattr(args, "telegram_token", None)
+    if token:
+        try:
+            return _activate_telegram_from_token(console, config, token, user_ids=user_ids)
+        except TelegramSetupError as exc:
+            console.console.print(f"[red]Token Telegram invalide:[/] {exc}")
+            return None
+
+    if getattr(args, "enable_telegram", False):
+        return _prompt_telegram_setup(console, config, user_ids=user_ids)
+
+    if Confirm.ask("Configurer Telegram pour piloter Magic Claw depuis ton telephone ?", default=False):
+        return _prompt_telegram_setup(console, config, user_ids=user_ids)
+    return config
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     console = MagicConsole()
     console.print_header()
@@ -259,6 +345,12 @@ def cmd_init(args: argparse.Namespace) -> int:
     if plan.compatibility == "not_recommended":
         if not Confirm.ask("This model is not recommended for stable H24 use. Continue anyway?", default=False):
             return 1
+
+    config = load_config()
+    configured = _configure_telegram_during_init(console, config, args)
+    if configured is None:
+        return 6
+    config = configured
 
     try:
         with console.task(f"Resolving GGUF file for {plan.option.display_name}") as status:
@@ -295,7 +387,6 @@ def cmd_init(args: argparse.Namespace) -> int:
         except LlamaBinaryError as exc:
             console.console.print(f"[yellow]Runtime warning: {exc}[/]")
 
-    config = load_config()
     config = merge_runtime(
         config,
         {
@@ -315,12 +406,6 @@ def cmd_init(args: argparse.Namespace) -> int:
             "llama_server_path": llama_path,
         },
     )
-    if args.telegram_token:
-        ENV_PATH.write_text(f"MAGIC_CLAW_TELEGRAM_TOKEN={args.telegram_token}\n", encoding="utf-8")
-    if args.enable_telegram or args.telegram_token:
-        config.telegram.enabled = True
-    if args.telegram_user_id:
-        config.telegram.allow_user_ids = args.telegram_user_id
     save_config(config)
     console.console.print(f"[green]Configuration written:[/] {CONFIG_PATH}")
 
@@ -389,6 +474,15 @@ def _run_supervisor(console: MagicConsole, config) -> int:
 
         model_name = Path(config.runtime.model_path).stem
         console.console.print(f"[green]Model ready:[/] {model_name}")
+        telegram_thread = supervisor.start_telegram_control()
+        if telegram_thread:
+            username = f"@{config.telegram.bot_username}" if config.telegram.bot_username else "Telegram"
+            console.console.print(f"[green]Telegram ready:[/] send /help to {username}.")
+        elif config.telegram.enabled:
+            console.console.print(
+                "[yellow]Telegram is enabled but no token is loaded. "
+                "Run `python -m magic_claw telegram setup` to reconnect it.[/]"
+            )
         console.console.print("Type a task and press Enter. Type [cyan]exit[/] to stop.")
         prompt_buffer = InteractivePromptBuffer()
         history: list[tuple[str, str]] = []
@@ -409,14 +503,15 @@ def _run_supervisor(console: MagicConsole, config) -> int:
                 continue
 
             with console.task("Processing task") as status:
-                supervisor.on_status = lambda message: status.update(message)
+                task_status = _terminal_task_status_callback(console, status, buffered_prompt)
+                supervisor.on_status = task_status
                 try:
                     supervisor.ensure_model_server_ready(timeout_seconds=240)
                     effective_prompt = _with_interactive_context(buffered_prompt, history)
                     result = supervisor.run_agent_task_result(
                         effective_prompt,
                         max_steps=60,
-                        on_status=lambda message: status.update(message),
+                        on_status=task_status,
                     )
                 except Exception as exc:
                     status.update("Task failed")
@@ -502,10 +597,19 @@ def cmd_task(args: argparse.Namespace) -> int:
         with console.task("Starting local model") as status:
             supervisor.on_status = lambda message: status.update(message)
             supervisor.start_model_server(timeout_seconds=420)
+        task_status = AgentStatusView(args.prompt)
+        console.console.print(f"[bold cyan]Task:[/] [dim]{escape(task_status.task)}[/]")
+
+        def print_task_status(message: str) -> None:
+            snapshot = task_status.update(message)
+            timestamp, action = snapshot.latest
+            prefix = f"{timestamp} | " if timestamp else ""
+            console.console.print(f"[cyan]*[/] {prefix}{escape(action)}")
+
         result = supervisor.run_agent_task_result(
             args.prompt,
             max_steps=args.max_steps,
-            on_status=lambda message: console.console.print(f"[cyan]*[/] {message}"),
+            on_status=print_task_status,
         )
     except Exception as exc:
         console.console.print(f"[red]Task failed:[/] {exc}")
@@ -517,6 +621,54 @@ def cmd_task(args: argparse.Namespace) -> int:
         return 0
     console.console.print(f"[red]{result.answer}[/]")
     return 1
+
+
+def cmd_telegram(args: argparse.Namespace) -> int:
+    console = MagicConsole()
+    config = load_config()
+    command = getattr(args, "telegram_command", None) or "status"
+
+    if command == "status":
+        token_state = "configured" if _telegram_token_configured(config) else "missing"
+        enabled = "enabled" if config.telegram.enabled else "disabled"
+        bot = f"@{config.telegram.bot_username}" if config.telegram.bot_username else "(unknown bot)"
+        console.console.print("Telegram status")
+        console.console.print(f"state: {enabled}")
+        console.console.print(f"token: {token_state}")
+        console.console.print(f"bot: {bot}")
+        if config.telegram.allow_user_ids:
+            console.console.print(f"allowed users: {', '.join(str(item) for item in config.telegram.allow_user_ids)}")
+        else:
+            console.console.print("allowed users: all")
+        return 0
+
+    if command == "setup":
+        try:
+            if args.token:
+                config = _activate_telegram_from_token(console, config, args.token, user_ids=args.user_id)
+            else:
+                config = _prompt_telegram_setup(console, config, user_ids=args.user_id)
+        except TelegramSetupError as exc:
+            console.console.print(f"[red]Telegram non configure:[/] {exc}")
+            return 2
+        save_config(config)
+        console.console.print(f"[green]Configuration written:[/] {CONFIG_PATH}")
+        return 0
+
+    if command == "disable":
+        config = disable_telegram(config)
+        save_config(config)
+        console.console.print("[yellow]Telegram disabled. Token kept for later reuse.[/]")
+        return 0
+
+    if command == "reset":
+        config = reset_telegram(config)
+        save_config(config)
+        console.console.print("[yellow]Telegram reset. Token removed.[/]")
+        return 0
+
+    console.console.print(f"[red]Unknown telegram command:[/] {command}")
+    return 2
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -534,6 +686,17 @@ def build_parser() -> argparse.ArgumentParser:
     init_parser.add_argument("--telegram-token", help="Store Telegram bot token in Magic Claw local .env")
     init_parser.add_argument("--telegram-user-id", action="append", type=int, help="Allowed Telegram user id; repeatable")
     init_parser.set_defaults(func=cmd_init)
+
+    telegram_parser = sub.add_parser("telegram", help="Configure Telegram control")
+    telegram_sub = telegram_parser.add_subparsers(dest="telegram_command")
+    telegram_sub.add_parser("status", help="Show Telegram configuration status").set_defaults(func=cmd_telegram)
+    telegram_setup = telegram_sub.add_parser("setup", help="Connect or change the Telegram bot")
+    telegram_setup.add_argument("--token", help="Telegram bot token from BotFather")
+    telegram_setup.add_argument("--user-id", action="append", type=int, help="Allowed Telegram user id; repeatable")
+    telegram_setup.set_defaults(func=cmd_telegram)
+    telegram_sub.add_parser("disable", help="Disable Telegram but keep the saved token").set_defaults(func=cmd_telegram)
+    telegram_sub.add_parser("reset", help="Disable Telegram and remove the saved token").set_defaults(func=cmd_telegram)
+    telegram_parser.set_defaults(func=cmd_telegram)
 
     sub.add_parser("run", help="Start the local terminal agent").set_defaults(func=cmd_run)
 

@@ -9,6 +9,7 @@ from magic_claw.agent import AgentLoop
 from magic_claw.agent.loop import AgentResult
 from magic_claw.config import MagicConfig
 from magic_claw.state import StateStore
+from magic_claw.status import AgentStatusView
 from magic_claw.telegram import TelegramBot
 
 from .llama_server import LlamaServer
@@ -29,6 +30,8 @@ class Supervisor:
         self.stop_event = threading.Event()
         self.restarts = 0
         self.on_status = on_status or (lambda _message: None)
+        self.task_lock = threading.Lock()
+        self.current_task_status = ""
 
     def status(self) -> SupervisorStatus:
         return SupervisorStatus(
@@ -39,28 +42,47 @@ class Supervisor:
 
     def status_text(self) -> str:
         status = self.status()
-        return (
+        text = (
             "Magic Claw status\n"
             f"model_healthy: {status.model_healthy}\n"
             f"telegram_enabled: {status.telegram_enabled}\n"
             f"restarts: {status.restarts}"
         )
+        if self.current_task_status:
+            text += f"\n\n{self.current_task_status}"
+        return text
 
     def run_agent_task_result(self, prompt: str, max_steps: int = 60, on_status=None) -> AgentResult:
         status_callback = on_status or self.on_status
-        loop = AgentLoop(
-            self.config.runtime,
-            self.config.workspace_dir,
-            self.state,
-            on_status=status_callback,
-        )
-        return loop.run(prompt, max_steps=max_steps)
+        with self.task_lock:
+            status_view = AgentStatusView(prompt)
+            self.current_task_status = status_view.snapshot().text
 
-    def run_agent_task(self, prompt: str) -> str:
-        result = self.run_agent_task_result(prompt)
+            def tracked_status(message: str) -> None:
+                self.current_task_status = status_view.update(message).text
+                status_callback(message)
+
+            loop = AgentLoop(
+                self.config.runtime,
+                self.config.workspace_dir,
+                self.state,
+                on_status=tracked_status,
+            )
+            try:
+                result = loop.run(prompt, max_steps=max_steps)
+                self.current_task_status = status_view.update(f"Task {result.status}.").text
+                return result
+            finally:
+                if not self.current_task_status:
+                    self.current_task_status = status_view.snapshot().text
+
+    def run_agent_task(self, prompt: str, on_status=None) -> str:
+        result = self.run_agent_task_result(prompt, on_status=on_status)
+        if result.status != "done":
+            raise RuntimeError(result.answer)
         return result.answer
 
-    def _start_telegram_thread(self) -> threading.Thread | None:
+    def start_telegram_control(self) -> threading.Thread | None:
         bot = TelegramBot(self.config.telegram, self.state)
         if not bot.enabled:
             return None
@@ -113,7 +135,7 @@ class Supervisor:
             try:
                 self.start_model_server(timeout_seconds=240)
                 if telegram_thread is None:
-                    telegram_thread = self._start_telegram_thread()
+                    telegram_thread = self.start_telegram_control()
 
                 backoff = 2.0
                 while not self.stop_event.is_set():
