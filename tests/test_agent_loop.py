@@ -530,6 +530,50 @@ def test_loop_safety_guard_stops_repeated_similar_writes():
         raise AssertionError("Expected repeated similar writes to be rejected")
 
 
+def test_agent_recovers_from_repeated_similar_write_loop(tmp_path):
+    workspace = tmp_path / "workspace"
+    (workspace / "src").mkdir(parents=True)
+    (workspace / "package.json").write_text(
+        '{"scripts":{"build":"node -e \\"process.exit(0)\\""}}',
+        encoding="utf-8",
+    )
+    statuses: list[str] = []
+    loop = AgentLoop(
+        RuntimeSettings(),
+        str(workspace),
+        StateStore(tmp_path / "state.sqlite"),
+        on_status=statuses.append,
+    )
+    repeated_write = (
+        '{"thought":"draft","tool":"write_file",'
+        '"args":{"path":"src/App.jsx","content":"export default 1;\\n"}}'
+    )
+    loop.client = StubModelClient(
+        [
+            repeated_write,
+            repeated_write,
+            repeated_write,
+            repeated_write,
+            repeated_write,
+            (
+                '{"thought":"change strategy","tool":"write_file",'
+                '"args":{"path":"src/App.jsx","content":"export default function App() { return null; }\\n'
+                + ("// filler\\n" * 50)
+                + '"}}'
+            ),
+            '{"thought":"commit repair","tool":"commit_file","args":{"path":"src/App.jsx"}}',
+            '{"thought":"done","tool":"final","args":{"answer":"Recovered."}}',
+        ]
+    )
+
+    result = loop.run("Create a React app", max_steps=8)
+
+    assert result.status == "done"
+    assert result.answer == "Recovered."
+    assert "return null" in (workspace / "src" / "App.jsx").read_text(encoding="utf-8")
+    assert any("Loop recovery requested: similar_write" in status for status in statuses)
+
+
 def test_run_shell_rejects_unbounded_dev_server(tmp_path):
     toolbox = AgentToolbox(tmp_path)
 

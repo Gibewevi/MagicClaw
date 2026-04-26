@@ -14,7 +14,8 @@ def task_excerpt(prompt: str, max_chars: int = 96) -> str:
 
 
 def clean_status_message(message: str) -> str:
-    clean = " ".join(str(message).strip().split())
+    value = str(message).replace("\u2713", "ok").replace("\u2717", "x")
+    clean = " ".join(value.strip().split())
     return clean or "Working..."
 
 

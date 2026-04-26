@@ -140,6 +140,17 @@ class IncompleteFileActionError(ValueError):
     pass
 
 
+class LoopRecoverySignal(RuntimeError):
+    def __init__(self, message: str, *, kind: str, path: str | None = None) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.path = path
+
+    @property
+    def recovery_key(self) -> str:
+        return f"{self.kind}:{self.path or '*'}"
+
+
 @dataclass
 class LoopSafetyGuard:
     max_mutation_retries_per_file: int = 20
@@ -177,9 +188,11 @@ class LoopSafetyGuard:
         if signature:
             self.error_counts[signature] += 1
             if self.error_counts[signature] >= self.max_same_error_retries:
-                raise RuntimeError(
+                raise LoopRecoverySignal(
                     "Repeated error loop detected after "
-                    f"{self.error_counts[signature]} retries: {signature}"
+                    f"{self.error_counts[signature]} retries: {signature}",
+                    kind="same_error",
+                    path=path,
                 )
 
         if tool == "write_file" and path:
@@ -191,9 +204,11 @@ class LoopSafetyGuard:
                 self.repeated_write_counts[write_key] = 1
                 self.last_write_key = write_key
             if self.repeated_write_counts[write_key] >= self.max_repeated_similar_writes:
-                raise RuntimeError(
+                raise LoopRecoverySignal(
                     "Repeated write loop detected: same file, similar size, and same "
-                    f"result for {path} ({self.repeated_write_counts[write_key]} attempts)."
+                    f"result for {path} ({self.repeated_write_counts[write_key]} attempts).",
+                    kind="similar_write",
+                    path=path,
                 )
 
 
@@ -613,6 +628,10 @@ def _observation_error_signature(observation: dict[str, Any]) -> str | None:
 
 
 def _validation_failure_summary(observation: dict[str, Any]) -> str | None:
+    if observation.get("loop_recovery"):
+        error = observation.get("error")
+        if isinstance(error, str) and error:
+            return _trim_text_middle(error, 1200)
     error = observation.get("error")
     if isinstance(error, str) and error:
         lowered = error.lower()
@@ -641,12 +660,46 @@ def _validation_failure_summary(observation: dict[str, Any]) -> str | None:
 def _validation_repair_feedback(summary: str | None) -> str:
     if not summary:
         return ""
+    if "loop detected" in summary.lower():
+        return (
+            "A loop guard was triggered. Do not repeat the same action unchanged. "
+            "Change strategy now: read the relevant files and package metadata, inspect "
+            "the failing validation, then make the smallest different repair. For frontend "
+            "tooling loops, prefer a simpler working setup such as plain CSS or the installed "
+            "framework defaults instead of rewriting the same config again.\n"
+            f"Loop diagnostic: {summary}"
+        )
     return (
         "Automatic validation failed. Fix this failure before any unrelated action "
         "or final response. Inspect the failing file if needed, update the draft in "
         "small chunks, commit it again, and wait for automatic validation to pass.\n"
         f"Validation failure: {summary}"
     )
+
+
+def _loop_recovery_observation(
+    tool: str,
+    args: dict[str, Any],
+    observation: dict[str, Any],
+    signal: LoopRecoverySignal,
+    recovery_count: int,
+) -> dict[str, Any]:
+    recovered = dict(observation)
+    recovered["error"] = str(signal)
+    recovered["tool"] = tool
+    recovered["loop_recovery"] = {
+        "kind": signal.kind,
+        "path": signal.path,
+        "attempt": recovery_count,
+        "instruction": (
+            "The task is still active. Stop repeating the same action and change strategy. "
+            "Read the relevant files or validation output, then repair with a different, "
+            "smaller action before final."
+        ),
+    }
+    if "path" not in recovered and isinstance(args.get("path"), str):
+        recovered["path"] = args["path"]
+    return recovered
 
 
 def _is_uncommitted_transaction(observation: dict[str, Any]) -> bool:
@@ -879,6 +932,8 @@ class AgentLoop:
             return
         command = _post_write_validation_command(str(self.tools.working_dir), path_value)
         if not command:
+            if self._last_validation_failure and "loop detected" in self._last_validation_failure.lower():
+                self._last_validation_failure = None
             return
         try:
             validation = self.tools.run_shell(command, timeout_seconds=180, inactivity_timeout_seconds=90)
@@ -927,6 +982,7 @@ class AgentLoop:
         continuation_count = 0
         continuation_memory: str | None = None
         safety_guard = LoopSafetyGuard()
+        loop_recovery_counts: Counter[str] = Counter()
         final_rejection_counts: Counter[str] = Counter()
         self._last_validation_failure = None
 
@@ -1041,7 +1097,30 @@ class AgentLoop:
                 validation_failure = _validation_failure_summary(observation)
                 if validation_failure:
                     self._last_validation_failure = validation_failure
-                safety_guard.record(tool, args, observation)
+                try:
+                    safety_guard.record(tool, args, observation)
+                except LoopRecoverySignal as exc:
+                    loop_recovery_counts[exc.recovery_key] += 1
+                    recovery_count = loop_recovery_counts[exc.recovery_key]
+                    if recovery_count > 3:
+                        raise RuntimeError(
+                            "Loop recovery failed after "
+                            f"{recovery_count - 1} forced strategy change(s): {exc}"
+                        ) from exc
+                    self.on_status(
+                        f"Loop recovery requested: {exc.kind}"
+                        + (f" for {exc.path}" if exc.path else "")
+                    )
+                    observation = _loop_recovery_observation(
+                        tool,
+                        args,
+                        observation,
+                        exc,
+                        recovery_count,
+                    )
+                    validation_failure = _validation_failure_summary(observation)
+                    if validation_failure:
+                        self._last_validation_failure = validation_failure
 
                 observation_text = json.dumps(observation, ensure_ascii=False)[:24000]
                 if (

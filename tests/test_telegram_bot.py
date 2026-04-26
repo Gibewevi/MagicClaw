@@ -68,11 +68,11 @@ def test_agent_status_view_keeps_task_excerpt_and_recent_history():
     view = AgentStatusView("Créer un projet météo très moderne pour Sherbrooke")
 
     first = view.update("Thinking | step 1/60")
-    second = view.update("Writing file: src/App.jsx | step 2/60")
+    second = view.update("Auto-validation failed: \u2717 Build failed in 391ms")
 
     assert "Task:" in second.text
     assert "Sherbrooke" in second.text
-    assert "Current action: Writing file: src/App.jsx | step 2/60" in second.text
+    assert "Current action: Auto-validation failed: x Build failed in 391ms" in second.text
     assert "Thinking | step 1/60" in second.text
     assert first.line == "Thinking | step 1/60"
     assert "task:" not in first.line
