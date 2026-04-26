@@ -1,4 +1,4 @@
-from magic_claw.cli import InteractivePromptBuffer, _with_interactive_context
+from magic_claw.cli import InteractivePromptBuffer, _combine_pasted_prompt, _with_interactive_context
 
 
 def test_prompt_buffer_runs_normal_requests_immediately():
@@ -19,6 +19,23 @@ def test_prompt_buffer_combines_section_heading_with_next_line():
 
     prompt, from_buffer = buffer.add("Creer un site meteo avec Vite")
     assert prompt == "Objectif :\nCreer un site meteo avec Vite"
+    assert from_buffer is True
+
+
+def test_prompt_buffer_runs_pasted_multiline_as_one_request():
+    buffer = InteractivePromptBuffer()
+    prompt = _combine_pasted_prompt(
+        "Creer un projet meteo avec Vite",
+        "Objectif : dashboard Sherbrooke\r\nAttentes UI/UX : premium desktop\r\n",
+    )
+
+    buffered, from_buffer = buffer.add(prompt)
+
+    assert buffered == (
+        "Creer un projet meteo avec Vite\n"
+        "Objectif : dashboard Sherbrooke\n"
+        "Attentes UI/UX : premium desktop"
+    )
     assert from_buffer is True
 
 

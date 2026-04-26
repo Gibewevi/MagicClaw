@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import time
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -32,6 +33,9 @@ from .ui import MagicConsole
 
 EXIT_COMMANDS = {"exit", "quit", "q", "stop"}
 BUFFER_RUN_COMMANDS = {"go", "lancer", "run", "start"}
+PASTE_DRAIN_IDLE_SECONDS = 0.08
+PASTE_DRAIN_MAX_SECONDS = 0.35
+PASTE_DRAIN_MAX_CHARS = 50000
 SECTION_HEADINGS = {
     "but",
     "contraintes",
@@ -202,6 +206,12 @@ class InteractivePromptBuffer:
 
     def add(self, prompt: str) -> tuple[str | None, bool]:
         stripped = prompt.strip()
+        if "\n" in stripped:
+            if self.parts:
+                combined = "\n".join([*self.parts, stripped])
+                self.parts.clear()
+                return combined, True
+            return stripped, True
         normalised = _normalise_cli_text(stripped)
         if self.parts and normalised in BUFFER_RUN_COMMANDS:
             combined = "\n".join(self.parts)
@@ -219,6 +229,58 @@ class InteractivePromptBuffer:
             self.parts.clear()
             return combined, True
         return stripped, False
+
+
+def _combine_pasted_prompt(first_line: str, extra_text: str) -> str:
+    text = first_line
+    if extra_text:
+        text = f"{first_line}\n{extra_text}"
+    lines = text.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    return "\n".join(line.rstrip() for line in lines)
+
+
+def _drain_pasted_stdin() -> str:
+    if os.name != "nt":
+        return ""
+    try:
+        import msvcrt
+    except ImportError:
+        return ""
+
+    chars: list[str] = []
+    start = time.monotonic()
+    idle_deadline = start + PASTE_DRAIN_IDLE_SECONDS
+    end_deadline = start + PASTE_DRAIN_MAX_SECONDS
+    while time.monotonic() < end_deadline and len(chars) < PASTE_DRAIN_MAX_CHARS:
+        if msvcrt.kbhit():
+            char = msvcrt.getwch()
+            if char == "\x03":
+                raise KeyboardInterrupt
+            if char in {"\x00", "\xe0"}:
+                if msvcrt.kbhit():
+                    msvcrt.getwch()
+                continue
+            chars.append(char)
+            idle_deadline = time.monotonic() + PASTE_DRAIN_IDLE_SECONDS
+            continue
+        if time.monotonic() >= idle_deadline:
+            break
+        time.sleep(0.01)
+    return "".join(chars)
+
+
+def _read_interactive_prompt(console: MagicConsole) -> str:
+    first_line = console.console.input("\n[bold cyan]Magic Claw > [/]")
+    extra_text = _drain_pasted_stdin()
+    prompt = _combine_pasted_prompt(first_line, extra_text).strip()
+    if extra_text.strip():
+        line_count = len(prompt.splitlines())
+        console.console.print(f"[dim]Captured pasted instruction ({line_count} lines).[/]")
+    return prompt
 
 
 def _with_interactive_context(prompt: str, history: list[tuple[str, str]]) -> str:
@@ -489,7 +551,7 @@ def _run_supervisor(console: MagicConsole, config) -> int:
 
         while True:
             try:
-                prompt = console.console.input("\n[bold cyan]Magic Claw > [/]").strip()
+                prompt = _read_interactive_prompt(console)
             except EOFError:
                 break
 
